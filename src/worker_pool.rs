@@ -267,6 +267,10 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
 mod tests {
     use super::*;
     use crate::{AbstractTree, Database, KeyspaceCreateOptions};
+    use std::{
+        sync::atomic::AtomicBool,
+        time::{Duration, Instant},
+    };
     use test_log::test;
 
     // https://github.com/fjall-rs/fjall/pull/303
@@ -307,6 +311,156 @@ mod tests {
                 "worker message should be compaction request",
             );
         }
+
+        Ok(())
+    }
+
+    fn worker_state(db: &Database, pool_size: usize, worker_id: usize) -> WorkerState {
+        WorkerState {
+            pool_size,
+            worker_id,
+            rx: db.worker_pool.rx.clone(),
+            sender: db.worker_pool.sender.clone(),
+            supervisor: db.supervisor.clone(),
+            stats: db.stats.clone(),
+        }
+    }
+
+    /// A worker must never wait for room in the queue it takes from: once every
+    /// worker does, nothing drains the queue, and every writer waits with them.
+    ///
+    /// Two workers send into their own queue: worker 0 hands a compaction back
+    /// (so that it stays free for flushes), and a memtable rotation, run by any
+    /// worker, queues a flush. The test runs one `worker_tick` on each of them
+    /// while another thread keeps the queue full, as halted writers that ask for
+    /// compactions do, and expects the tick to return.
+    #[test]
+    fn worker_never_waits_for_room_in_its_own_queue() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let db = Database::builder(&folder)
+            .worker_threads_unchecked(0)
+            .open()?;
+        let ks = db.keyspace("default", KeyspaceCreateOptions::default)?;
+        let (rx, sender) = (&db.worker_pool.rx, &db.worker_pool.sender);
+        let mut blocked = vec![];
+
+        for worker_id in [1, 0] {
+            ks.insert("a", "a")?;
+            rx.drain().count();
+            db.supervisor.flush_manager.clear();
+
+            let first = if worker_id == 1 {
+                WorkerMessage::RotateMemtable(ks.clone(), ks.tree.active_memtable().id())
+            } else {
+                WorkerMessage::Compact(ks.clone())
+            };
+            sender.send(first).expect("queue is open");
+            while sender.try_send(WorkerMessage::Compact(ks.clone())).is_ok() {}
+
+            let ctx = worker_state(&db, 2, worker_id);
+            let done = AtomicBool::new(false);
+
+            let returned = std::thread::scope(|scope| -> crate::Result<bool> {
+                scope.spawn(|| {
+                    while !done.load(Relaxed) {
+                        sender.try_send(WorkerMessage::Compact(ks.clone())).ok();
+                        std::thread::yield_now();
+                    }
+                });
+
+                let worker = scope.spawn(|| worker_tick(&ctx).map(|_| ()));
+
+                let start = Instant::now();
+                while !worker.is_finished() && start.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let returned = worker.is_finished();
+
+                // Let a blocked worker go, so that the test ends
+                done.store(true, Relaxed);
+                while !worker.is_finished() {
+                    rx.try_recv().ok();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                worker.join().expect("worker panicked")?;
+
+                Ok(returned)
+            })?;
+
+            if !returned {
+                blocked.push(worker_id);
+            }
+        }
+
+        assert!(
+            blocked.is_empty(),
+            "workers {blocked:?} waited for room in their own queue",
+        );
+
+        Ok(())
+    }
+
+    /// A writer halted at 30 L0 runs must be released by the workers even when no
+    /// compaction is queued or running any more: the halted writer flushes nothing,
+    /// so nothing else asks for one.
+    ///
+    /// The keyspace gets 30 overlapping L0 runs with an empty queue, two workers
+    /// run the pool's loop, and a write is expected to complete.
+    #[test]
+    fn write_halt_ends_without_pending_compaction() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let db = Database::builder(&folder)
+            .worker_threads_unchecked(0)
+            .open()?;
+        let items = db.keyspace("items", KeyspaceCreateOptions::default)?;
+
+        for i in 0u64..30 {
+            items.insert("overlap", i.to_be_bytes().to_vec())?;
+            items.tree.rotate_memtable();
+            let lock = items.tree.get_flush_lock();
+            items.tree.flush(&lock, 0)?;
+        }
+        assert_eq!(30, items.tree.l0_run_count());
+        db.worker_pool.rx.drain().count();
+
+        let released = std::thread::scope(|scope| -> crate::Result<bool> {
+            let workers = (0..2)
+                .map(|worker_id| {
+                    let ctx = worker_state(&db, 2, worker_id);
+                    scope.spawn(move || -> crate::Result<()> {
+                        while !worker_tick(&ctx)? {}
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let writer = scope.spawn(|| items.insert("final", "value"));
+
+            let start = Instant::now();
+            while !writer.is_finished() && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let released = writer.is_finished();
+
+            // Let a writer that is still halted go, so that the test ends
+            while !writer.is_finished() {
+                crate::compaction::worker::run(&items, &db.supervisor.snapshot_tracker, &db.stats)?;
+            }
+            writer.join().expect("writer panicked")?;
+
+            for _ in &workers {
+                db.worker_pool.sender.send(WorkerMessage::Close).ok();
+            }
+            for worker in workers {
+                worker.join().expect("worker panicked")?;
+            }
+
+            Ok(released)
+        })?;
+
+        assert!(released, "the halted writer was never released");
+        assert!(items.tree.l0_run_count() < 30);
+        assert_eq!(items.get("final")?.as_deref(), Some(b"value".as_slice()));
 
         Ok(())
     }
