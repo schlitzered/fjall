@@ -29,6 +29,24 @@ pub struct Journal {
     writer: Mutex<Writer>,
 }
 
+/// Writers hold the journal lock from taking a seqno until they have published it.
+///
+/// lsm-tree takes it when it makes a new version (flush, compaction, ingestion) visible,
+/// so it never publishes a seqno above a write batch that is being applied
+/// (<https://github.com/fjall-rs/fjall/issues/333>).
+impl lsm_tree::PublishLock for Journal {
+    fn with_lock(&self, f: &mut dyn FnMut()) {
+        // NOTE: We only need the mutual exclusion here, not the writer,
+        // so a poisoned journal writer is not a reason to fail
+        let _lock = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        f();
+    }
+}
+
 impl std::fmt::Debug for Journal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

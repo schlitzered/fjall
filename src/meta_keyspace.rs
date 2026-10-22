@@ -4,8 +4,8 @@
 
 use crate::{db::Keyspaces, keyspace::InternalKeyspaceId, Keyspace};
 use byteview::StrView;
-use lsm_tree::{AbstractTree, AnyTree, SeqNo, SequenceNumberCounter, UserValue};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use lsm_tree::{AbstractTree, AnyTree, SeqNo, UserValue};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 pub fn encode_config_key(keyspace_id: InternalKeyspaceId, name: &str) -> crate::UserKey {
     use byteorder::{WriteBytesExt, BE};
@@ -52,23 +52,28 @@ pub struct MetaKeyspace {
     #[doc(hidden)]
     pub keyspaces: Arc<RwLock<Keyspaces>>,
 
-    seqno_generator: SequenceNumberCounter,
-    visible_seqno: SequenceNumberCounter,
+    /// Serializes keyspace creation and deletion
+    ///
+    /// Both write to the meta keyspace through an ingestion, which takes the journal lock
+    /// to publish its version. Writers take the keyspaces lock while holding the journal lock,
+    /// so creation and deletion must not hold the keyspaces lock during the ingestion,
+    /// and use this lock instead.
+    ddl_lock: Arc<Mutex<()>>,
 }
 
 impl MetaKeyspace {
-    pub(crate) fn new(
-        inner: AnyTree,
-        keyspaces: Arc<RwLock<Keyspaces>>,
-        seqno_generator: SequenceNumberCounter,
-        visible_seqno: SequenceNumberCounter,
-    ) -> Self {
+    pub(crate) fn new(inner: AnyTree, keyspaces: Arc<RwLock<Keyspaces>>) -> Self {
         Self {
             inner,
             keyspaces,
-            seqno_generator,
-            visible_seqno,
+            ddl_lock: Arc::default(),
         }
+    }
+
+    /// Locks out other keyspace creations and deletions.
+    pub(crate) fn lock_ddl(&self) -> MutexGuard<'_, ()> {
+        #[expect(clippy::expect_used)]
+        self.ddl_lock.lock().expect("lock is poisoned")
     }
 
     #[cfg(test)]
@@ -98,12 +103,15 @@ impl MetaKeyspace {
             .map_err(Into::into)
     }
 
+    /// Stores the keyspace's config and adds it to the keyspaces.
+    ///
+    /// The caller has to hold the DDL lock (see [`MetaKeyspace::lock_ddl`]),
+    /// but not the keyspaces lock.
     pub(crate) fn create_keyspace(
         &self,
         keyspace_id: InternalKeyspaceId,
         name: &str,
         keyspace: Keyspace,
-        mut keyspaces: RwLockWriteGuard<'_, Keyspaces>,
     ) -> crate::Result<()> {
         let mut kvs = keyspace.config.encode_kvs(keyspace_id);
 
@@ -136,7 +144,11 @@ impl MetaKeyspace {
 
         ingestion.finish()?;
 
-        keyspaces.insert(name.into(), keyspace);
+        #[expect(clippy::expect_used)]
+        self.keyspaces
+            .write()
+            .expect("lock is poisoned")
+            .insert(name.into(), keyspace);
 
         self.maintenance()
             .inspect_err(|e| {
@@ -148,13 +160,18 @@ impl MetaKeyspace {
     }
 
     pub(crate) fn remove_keyspace(&self, name: &str) -> crate::Result<()> {
-        let mut lock = self.keyspaces.write().expect("lock is poisoned");
+        let _ddl_lock = self.lock_ddl();
 
-        let Some(keyspace) = lock.get(name) else {
+        #[expect(clippy::expect_used)]
+        let Some(keyspace) = self
+            .keyspaces
+            .read()
+            .expect("lock is poisoned")
+            .get(name)
+            .cloned()
+        else {
             return Ok(());
         };
-
-        let seqno = self.seqno_generator.next();
 
         let mut ingestion = self.inner.ingestion()?;
         {
@@ -182,9 +199,10 @@ impl MetaKeyspace {
         }
         ingestion.finish()?;
 
-        self.visible_seqno.fetch_max(seqno + 1);
-
-        lock.remove(name);
+        self.keyspaces
+            .write()
+            .expect("lock is poisoned")
+            .remove(name);
 
         self.maintenance()
             .inspect_err(|e| {

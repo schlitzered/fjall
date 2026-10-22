@@ -34,7 +34,9 @@ impl<'a> Ingestion<'a> {
     }
 
     pub fn finish(self) -> crate::Result<()> {
-        // NOTE: We hold to avoid a race condition with concurrent writes:
+        // NOTE: lsm-tree holds the journal lock (the tree's publish lock) from flushing
+        // the active memtable until the ingested tables are published,
+        // to avoid a race condition with concurrent writes:
         //
         // write         ingest
         // lock journal
@@ -49,8 +51,8 @@ impl<'a> Ingestion<'a> {
         // -----------------
         // |
         // insert seqno=1
-        let _journal_lock = self.keyspace.supervisor.journal.get_writer()?;
-
+        //
+        // It takes the tree's flush lock first, so we must not hold the journal lock here.
         self.inner
             .finish()
             .inspect(|()| {

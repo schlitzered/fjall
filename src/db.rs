@@ -463,11 +463,27 @@ impl Database {
     ) -> crate::Result<Keyspace> {
         assert!(is_valid_keyspace_name(name));
 
-        let keyspaces = self.supervisor.keyspaces.write().expect("lock is poisoned");
+        let get_existing = || {
+            self.supervisor
+                .keyspaces
+                .read()
+                .expect("lock is poisoned")
+                .get(name)
+                .cloned()
+        };
 
-        Ok(if let Some(keyspace) = keyspaces.get(name) {
+        if let Some(keyspace) = get_existing() {
             log::trace!("Opening existing keyspace {name:?}");
-            keyspace.clone()
+            return Ok(keyspace);
+        }
+
+        // NOTE: Creating the keyspace writes to the meta keyspace, which takes the journal lock,
+        // so we must not hold the keyspaces lock (writers take it under the journal lock)
+        let _ddl_lock = self.meta_keyspace.lock_ddl();
+
+        Ok(if let Some(keyspace) = get_existing() {
+            log::trace!("Opening existing keyspace {name:?}");
+            keyspace
         } else {
             let keyspace_id = self.allocate_keyspace_id()?;
 
@@ -487,7 +503,7 @@ impl Database {
             let handle = Keyspace::create_new(keyspace_id, self, name.clone(), opts)?;
 
             self.meta_keyspace
-                .create_keyspace(keyspace_id, &name, handle.clone(), keyspaces)?;
+                .create_keyspace(keyspace_id, &name, handle.clone())?;
 
             #[cfg(feature = "__internal_whitebox")]
             crate::drop::increment_drop_counter();
@@ -610,6 +626,9 @@ impl Database {
             visible_seqno.clone(),
         )
         .use_cache(config.cache.clone())
+        .with_publish_lock(Some(
+            active_journal.clone() as Arc<dyn lsm_tree::PublishLock>
+        ))
         .use_descriptor_table(config.descriptor_table.clone())
         .expect_point_read_hits(true)
         .data_block_size_policy(crate::config::BlockSizePolicy::all(4_096))
@@ -629,12 +648,7 @@ impl Database {
 
         let keyspaces = Arc::new(RwLock::default());
 
-        let meta_keyspace = MetaKeyspace::new(
-            meta_tree,
-            keyspaces.clone(),
-            seqno.clone(),
-            visible_seqno.clone(),
-        );
+        let meta_keyspace = MetaKeyspace::new(meta_tree, keyspaces.clone());
 
         let supervisor = Supervisor::new(SupervisorInner {
             db_config: config.clone(),
@@ -886,6 +900,7 @@ impl Database {
             visible_seqno.clone(),
         )
         .use_cache(config.cache.clone())
+        .with_publish_lock(Some(journal.clone() as Arc<dyn lsm_tree::PublishLock>))
         .use_descriptor_table(config.descriptor_table.clone())
         .expect_point_read_hits(true)
         .data_block_size_policy(crate::config::BlockSizePolicy::all(4_096))
@@ -905,12 +920,7 @@ impl Database {
 
         let keyspaces = Arc::new(RwLock::default());
 
-        let meta_keyspace = MetaKeyspace::new(
-            meta_tree,
-            keyspaces.clone(),
-            seqno.clone(),
-            visible_seqno.clone(),
-        );
+        let meta_keyspace = MetaKeyspace::new(meta_tree, keyspaces.clone());
 
         let supervisor = Supervisor::new(SupervisorInner {
             db_config: config.clone(),

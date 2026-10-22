@@ -91,7 +91,10 @@ pub fn recover_keyspaces(db: &Database, meta_keyspace: &MetaKeyspace) -> crate::
             db.supervisor.snapshot_tracker.get_ref(),
         )
         .use_descriptor_table(db.config.descriptor_table.clone())
-        .use_cache(db.config.cache.clone());
+        .use_cache(db.config.cache.clone())
+        .with_publish_lock(Some(
+            db.supervisor.journal.clone() as std::sync::Arc<dyn lsm_tree::PublishLock>
+        ));
 
         let base_config = apply_to_base_config(base_config, &recovered_config);
 
