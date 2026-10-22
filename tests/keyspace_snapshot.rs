@@ -106,3 +106,62 @@ fn keyspace_torn_read() -> fjall::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn keyspace_snapshot_sees_ingestion() -> fjall::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    let db = Database::builder(&folder).open()?;
+
+    let tree = db.keyspace("default", KeyspaceCreateOptions::default)?;
+
+    let before = db.snapshot();
+
+    let mut ingestion = tree.start_ingestion()?;
+    ingestion.write("a", "a")?;
+    ingestion.write("b", "b")?;
+    ingestion.finish()?;
+
+    assert!(!before.contains_key(&tree, "a")?);
+    assert!(!before.contains_key(&tree, "b")?);
+
+    let after = db.snapshot();
+    assert!(after.contains_key(&tree, "a")?);
+    assert!(after.contains_key(&tree, "b")?);
+    assert_eq!(2, after.iter(&tree).count());
+
+    Ok(())
+}
+
+#[test]
+fn keyspace_visible_seqno_advances_with_version_installs() -> fjall::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    let db = Database::builder(&folder).open()?;
+
+    let tree = db.keyspace("default", KeyspaceCreateOptions::default)?;
+
+    tree.insert("a", "a")?;
+    let before_flush = db.visible_seqno();
+
+    tree.rotate_memtable_and_wait()?;
+
+    // NOTE: The flush worker publishes the new version right after installing it
+    let start = std::time::Instant::now();
+    while db.visible_seqno() == before_flush {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "flush should publish its version",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    tree.insert("b", "b")?;
+    tree.rotate_memtable_and_wait()?;
+    let before_compaction = db.visible_seqno();
+
+    tree.major_compact()?;
+    assert!(db.visible_seqno() > before_compaction);
+
+    Ok(())
+}
